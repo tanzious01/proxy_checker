@@ -101,44 +101,64 @@ async fn main() {
     download_http_proxies().await.unwrap();
     let my_vec = make_vec("proxies_raw_http.txt".to_string()).await.unwrap();
     let chunk_size = (my_vec.len()) / 3; // round up to the nearest integer
-    let chunks = my_vec.chunks(chunk_size);
-    let mut vec1 = Vec::new();
-    let mut vec2 = Vec::new();
-    let mut vec3 = Vec::new();
-    let mut vec4 = Vec::new();
-    for (i, chunk) in chunks.enumerate() {
-        match i {
-            0 => vec1 = chunk.to_vec(),
-            1 => vec2 = chunk.to_vec(),
-            2 => vec3 = chunk.to_vec(),
-            3 => vec4 = chunk.to_vec(),
-            _ => unreachable!(),
-        }
-    }
-    tokio::join!(
-        final_req(vec1),
-        final_req(vec2),
-        final_req(vec3),
-        final_req(vec4),
+    let mut iter = my_vec.chunks(chunk_size);
+    let [vec1, vec2, vec3, vec4] = std::array::from_fn(|_| iter.next().unwrap_or(&[]).to_vec());
+   tokio::join!(
+        finaly_req(vec1),
+        finaly_req(vec2),
+        finaly_req(vec3),
+        finaly_req(vec4),
     );
+    check_duplicates().await;
     let end = Instant::now();
     println!("Took: {:?} seconds", end - start);
 }
-async fn finaly_req(proxy_list: Vec<String>) -> Result<(), reqwest::Error> {
-    let url = "https://ipconfig.io/json";
-    let file = OpenOptions::new()
+
+
+
+async fn check_duplicates() -> Result<(), reqwest::Error> {
+    let input_file = tokio::fs::File::open("curated_proxy_list.txt").await;
+    let mut output_file = OpenOptions::new()
         .append(true) // open the file in append mode
         .create(true) // create the file if it doesn't exist
         .open("working_proxies.txt")
         .expect("could not open file");
+    let reader = tokio::io::BufReader::new(input_file.unwrap());
+    let mut lines = reader.lines();
+    let mut set = HashSet::new();
+    while let Some(line) = lines.next_line().await.transpose() {
+        if !set.contains(line.as_ref().unwrap()){
+            let dupe = line.as_ref().unwrap().clone();
+            set.insert(line.unwrap());
+            output_file.write(format!("{}\n",dupe).as_bytes());
+        }
+    }
+  
+    Ok(())
+}
+
+
+
+
+
+
+
+
+async fn finaly_req(proxy_list: Vec<String>) -> Result<(), reqwest::Error> {
+    let url = "https://ipconfig.io/json";
+    let mut tasks = vec![];
+    let file = OpenOptions::new()
+        .append(true) // open the file in append mode
+        .create(true) // create the file if it doesn't exist
+        .open("curated_proxy_list.txt")
+        .expect("could not open file");
     let file = std::sync::Arc::new(std::sync::Mutex::new(file));
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(300)); // limit to 2000 open files at once
-    let pool = tokio::task::LocalSet::new();
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(300)); // limit to 2000 open files at onc
     for proxy in proxy_list {
         let file_clone = file.clone();
         let print_proxy = proxy.clone();
         let semaphore_clone = semaphore.clone();
-        pool.spawn_local(async move {
+        let task = tokio::spawn(async move {
             let permit = semaphore_clone.acquire().await.unwrap();
             let proxy = Proxy::https(proxy);
             let client = Client::builder()
@@ -166,7 +186,8 @@ async fn finaly_req(proxy_list: Vec<String>) -> Result<(), reqwest::Error> {
             }
             drop(permit); // release the permit when done with the file
         });
+        tasks.push(task);
     }
-    pool.await;
+    futures::future::join_all(tasks).await;
     Ok(())
 }
