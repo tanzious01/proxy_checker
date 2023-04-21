@@ -1,16 +1,16 @@
-use reqwest::{Client, Proxy};
-use serde::*;
+
+use reqwest::{Client, StatusCode};
+use serde_json::Value;
 use std::collections::HashSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+use std::sync::Arc;
+use std::sync::Mutex;
+use tokio::task::spawn;
 use std::path::Path;
-use std::time::Duration;
-use std::time::Instant;
-use tokio::{fs::File as AsyncFile, io::AsyncBufReadExt, io::AsyncWriteExt, task};
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Welcome {
-    ip: String,
-}
+use std::time::{Duration, Instant};
+use tokio::{fs::File as AsyncFile, io::AsyncBufReadExt, io::AsyncWriteExt, task, sync::Semaphore};
+
 
 async fn download_http_proxies() -> Result<(), reqwest::Error> {
   const URLS: &[&str] = &[
@@ -33,161 +33,90 @@ async fn download_http_proxies() -> Result<(), reqwest::Error> {
 
     Ok(())
 }
-
-async fn make_vec(filename: String) -> Result<Vec<String>, reqwest::Error> {
-    let file = tokio::fs::File::open(filename).await;
-    let reader = tokio::io::BufReader::new(file.unwrap());
-    let mut lines = reader.lines();
-    let mut set = HashSet::new();
-    while let Some(line) = lines.next_line().await.transpose() {
-        if !set.contains(line.as_ref().unwrap()) {
-            set.insert(line.unwrap());
-        }
-    }
-    let vec: Vec<String> = set.into_iter().collect();
-    println!("{:?}", vec.len());
-    Ok(vec)
-}
-
-async fn final_req(proxy_list: Vec<String>) -> Result<(), reqwest::Error> {
-    let url = "https://ipconfig.io/json";
-    let file = OpenOptions::new()
-        .append(true) // open the file in append mode
-        .create(true) // create the file if it doesn't exist
-        .open("working_proxies.txt")
-        .expect("could not open file");
-    let file = std::sync::Arc::new(std::sync::Mutex::new(file));
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(300)); // limit to 2000 open files at once
-    let pool = tokio::task::LocalSet::new();
-    for proxy in proxy_list {
-        let file_clone = file.clone();
-        let print_proxy = proxy.clone();
-        let semaphore_clone = semaphore.clone();
-        pool.spawn_local(async move {
-            let permit = semaphore_clone.acquire().await.unwrap();
-            let proxy = Proxy::https(proxy);
-            let client = Client::builder()
-                .danger_accept_invalid_certs(true)
-                .pool_idle_timeout(Duration::from_secs(2))
-                .pool_max_idle_per_host(5)
-                .proxy(proxy.unwrap())
-                .build();
-            let response = client
-                .expect("joe")
-                .get(url)
-                .header("Accept", "text/plain")
-                .timeout(Duration::from_secs(35))
-                .send()
-                .await
-                .expect("joe2")
-                .json::<Welcome>()
-                .await;
-            match response {
-                Ok(response) => {
-                    let mut file = file_clone.lock().unwrap();
-                    file.write(format!("{}\n", print_proxy).as_bytes());
-                }
-                Err(e) => println!("{:?}", e),
-            }
-            drop(permit); // release the permit when done with the file
-        });
-    }
-    pool.await;
-    Ok(())
-}
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
-    download_http_proxies().await.unwrap();
-    let my_vec = make_vec("proxies_raw_http.txt".to_string()).await.unwrap();
-    let chunk_size = (my_vec.len()) / 3; // round up to the nearest integer
-    let mut iter = my_vec.chunks(chunk_size);
-    let [vec1, vec2, vec3, vec4] = std::array::from_fn(|_| iter.next().unwrap_or(&[]).to_vec());
-   tokio::join!(
-        finaly_req(vec1),
-        finaly_req(vec2),
-        finaly_req(vec3),
-        finaly_req(vec4),
-    );
-    check_duplicates().await;
-    let end = Instant::now();
-    println!("Took: {:?} seconds", end - start);
-}
+    let local_ip = reqwest::get("https://ipinfo.io/json")
+        .await?
+        .json::<Value>()
+        .await?
+        .get("ip")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
 
+    let unvalidated_proxies = open_text("proxies_raw_http.txt");
+    let unique_proxies: HashSet<String> = unvalidated_proxies.into_iter().collect();
+    let valid_proxies = Arc::new(Mutex::new(Vec::new()));
+    let mut tasks = Vec::new();
+    let concurrent_limit = Arc::new(Semaphore::new(300)); // Limit concurrent tasks to 100
 
-
-async fn check_duplicates() -> Result<(), reqwest::Error> {
-    let input_file = tokio::fs::File::open("curated_proxy_list.txt").await;
-    let mut output_file = OpenOptions::new()
-        .append(true) // open the file in append mode
-        .create(true) // create the file if it doesn't exist
-        .open("working_proxies.txt")
-        .expect("could not open file");
-    let reader = tokio::io::BufReader::new(input_file.unwrap());
-    let mut lines = reader.lines();
-    let mut set = HashSet::new();
-    while let Some(line) = lines.next_line().await.transpose() {
-        if !set.contains(line.as_ref().unwrap()){
-            let dupe = line.as_ref().unwrap().clone();
-            set.insert(line.unwrap());
-            output_file.write(format!("{}\n",dupe).as_bytes());
-        }
-    }
-  
-    Ok(())
-}
-
-
-
-
-
-
-
-
-async fn finaly_req(proxy_list: Vec<String>) -> Result<(), reqwest::Error> {
-    let url = "https://ipconfig.io/json";
-    let mut tasks = vec![];
-    let file = OpenOptions::new()
-        .append(true) // open the file in append mode
-        .create(true) // create the file if it doesn't exist
-        .open("curated_proxy_list.txt")
-        .expect("could not open file");
-    let file = std::sync::Arc::new(std::sync::Mutex::new(file));
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(300)); // limit to 2000 open files at onc
-    for proxy in proxy_list {
-        let file_clone = file.clone();
-        let print_proxy = proxy.clone();
-        let semaphore_clone = semaphore.clone();
+    for proxy in unique_proxies {
+        let valid_proxies = Arc::clone(&valid_proxies);
+        let local_ip = local_ip.clone();
+        let concurrent_limit = Arc::clone(&concurrent_limit);
         let task = tokio::spawn(async move {
-            let permit = semaphore_clone.acquire().await.unwrap();
-            let proxy = Proxy::https(proxy);
-            let client = Client::builder()
-                .danger_accept_invalid_certs(true)
-                .pool_idle_timeout(Duration::from_secs(2))
-                .pool_max_idle_per_host(5)
-                .proxy(proxy.unwrap())
-                .build();
-            let response = client
-                .expect("error")
-                .get(url)
-                .header("Accept", "text/plain")
-                .timeout(Duration::from_secs(35))
-                .send()
-                .await
-                .expect("joe2")
-                .json::<Welcome>()
-                .await;
-            match response {
-                Ok(response) => {
-                    let mut file = file_clone.lock().unwrap();
-                    file.write(format!("{}\n", print_proxy).as_bytes());
-                }
-                Err(e) => println!("{:?}", e),
+            let _permit = concurrent_limit.acquire().await;
+            if let Some(valid_proxy) = validate_proxy(proxy, &local_ip).await {
+                valid_proxies.lock().unwrap().push(valid_proxy);
             }
-            drop(permit); // release the permit when done with the file
         });
         tasks.push(task);
     }
+
     futures::future::join_all(tasks).await;
+
+    let valid_proxies = valid_proxies.lock().unwrap();
+    println!("Proxies found: {}", valid_proxies.len());
+    let mut file = File::create("working_proxies.txt")?;
+    for proxy in &*valid_proxies {
+        writeln!(file, "{}", proxy)?;
+    }
+    println!("{:?}",start.elapsed());
     Ok(())
 }
+fn open_text(filename: &str) -> Vec<String> {
+    let file = File::open(filename).unwrap();
+    let reader = BufReader::new(file);
+    reader.lines().map(|line| line.unwrap()).collect()
+}
+
+
+
+
+async fn validate_proxy(proxy: String, local_ip: &str) -> Option<String> {
+    let client = Client::builder()
+        .proxy(reqwest::Proxy::all(&proxy).ok()?)
+        .build()
+        .ok()?;
+
+    let result = client
+        .get("https://ipinfo.io/json")
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await;
+
+    match result {
+        Ok(response) => match response.status() {
+            StatusCode::OK => {
+                let json_response: Value = response.json().await.ok()?;
+                if local_ip == json_response.get("ip")?.as_str()? {
+                    println!("Leaking");
+                    None
+                } else {
+                    println!("{:?}", json_response);
+                    Some(proxy)
+                }
+            }
+            StatusCode::TOO_MANY_REQUESTS => {
+                println!("429 get lit");
+                None
+            }
+            _ => None,
+        },
+        Err(_) => None,
+    }
+}
+
+
